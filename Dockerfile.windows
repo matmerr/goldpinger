@@ -1,0 +1,16 @@
+FROM golang:1.17 AS builder
+
+WORKDIR /w
+COPY go.mod go.sum /w/
+RUN go mod download
+COPY . ./
+RUN $Env:CGO_ENABLED=0; go build -v -o /goldpinger.exe  ./cmd/goldpinger/
+
+
+# Copy into final image
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+COPY ./static /static
+COPY --from=builder /goldpinger.exe /goldpinger.exe
+
+
+ENTRYPOINT ["/goldpinger.exe", "--static-file-path", "/static"]
