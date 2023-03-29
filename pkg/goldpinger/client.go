@@ -17,9 +17,9 @@ package goldpinger
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,15 +37,12 @@ func CheckNeighbours(ctx context.Context) *models.CheckResults {
 	// Mux to prevent concurrent map address
 	checkResultsMux.Lock()
 	defer checkResultsMux.Unlock()
-
 	final := models.CheckResults{}
 	final.PodResults = make(map[string]models.PodResult)
 	for podName, podResult := range checkResults.PodResults {
 		final.PodResults[podName] = podResult
 	}
-	if len(GoldpingerConfig.DnsHosts) > 0 {
-		final.DNSResults = *checkDNS()
-	}
+	final.ProbeResults = checkTargets()
 	return &final
 }
 
@@ -57,7 +54,6 @@ func CheckNeighboursNeighbours(ctx context.Context) *models.CheckAllResults {
 
 // CheckCluster does a CheckNeighboursNeighbours and analyses results to produce a binary OK or not OK
 func CheckCluster(ctx context.Context) *models.ClusterHealthResults {
-
 	start := time.Now()
 	output := models.ClusterHealthResults{
 		GeneratedAt: strfmt.DateTime(start),
@@ -128,22 +124,58 @@ func pickPodHostIP(podIP, hostIP string) string {
 	return podIP
 }
 
-func checkDNS() *models.DNSResults {
-	results := models.DNSResults{}
-	for _, host := range GoldpingerConfig.DnsHosts {
-
-		var dnsResult models.DNSResult
-
-		start := time.Now()
-		_, err := net.LookupIP(host)
-		if err != nil {
-			dnsResult.Error = err.Error()
-			CountDnsError(host)
-		}
-		dnsResult.ResponseTimeMs = time.Since(start).Nanoseconds() / int64(time.Millisecond)
-		results[host] = dnsResult
+func checkTargets() models.ProbeResults {
+	results := make(map[string][]models.ProbeResult)
+	probes := []struct {
+		protocol string
+		hosts    []string
+		probeFn  func(addr string, timeout time.Duration) error
+		statFn   func(host string)
+		timeout  time.Duration
+	}{
+		{
+			protocol: "dns",
+			hosts:    GoldpingerConfig.DnsHosts,
+			probeFn:  doDNSProbe,
+			statFn:   CountDnsError,
+			timeout:  GoldpingerConfig.DnsCheckTimeout,
+		},
+		{
+			protocol: "http",
+			hosts:    GoldpingerConfig.HTTPTargets,
+			probeFn:  doHTTPProbe,
+			statFn:   CountHttpError,
+			timeout:  GoldpingerConfig.HTTPCheckTimeout,
+		},
+		{
+			protocol: "tcp",
+			hosts:    GoldpingerConfig.TCPTargets,
+			probeFn:  doTCPProbe,
+			statFn:   CountTcpError,
+			timeout:  GoldpingerConfig.TCPCheckTimeout,
+		},
 	}
-	return &results
+
+	for _, probe := range probes {
+		for _, host := range probe.hosts {
+			if _, ok := results[host]; !ok {
+				results[host] = []models.ProbeResult{}
+			}
+
+			res := models.ProbeResult{Protocol: probe.protocol}
+			start := time.Now()
+			err := probe.probeFn(host, probe.timeout)
+			if err != nil {
+				res.Error = err.Error()
+				probe.statFn(host)
+			}
+
+			res.ResponseTimeMs = time.Since(start).Milliseconds()
+			results[host] = append(results[host], res)
+		}
+	}
+
+	return results
 }
 
 // CheckServicePodsResult results of the /check operation
@@ -156,7 +188,6 @@ type CheckServicePodsResult struct {
 
 // CheckAllPods calls all neighbours and returns a detailed report
 func CheckAllPods(checkAllCtx context.Context, pods map[string]*GoldpingerPod) *models.CheckAllResults {
-
 	result := models.CheckAllResults{Responses: make(map[string]models.CheckAllPodResult)}
 
 	ch := make(chan CheckServicePodsResult, len(pods))
@@ -164,9 +195,7 @@ func CheckAllPods(checkAllCtx context.Context, pods map[string]*GoldpingerPod) *
 	wg.Add(len(pods))
 
 	for _, pod := range pods {
-
 		go func(pod *GoldpingerPod) {
-
 			// logger
 			logger := zap.L().With(
 				zap.String("op", "check"),
@@ -199,7 +228,7 @@ func CheckAllPods(checkAllCtx context.Context, pods map[string]*GoldpingerPod) *
 			} else {
 				checkCtx, cancel := context.WithTimeout(
 					checkAllCtx,
-					time.Duration(GoldpingerConfig.CheckTimeoutMs)*time.Millisecond,
+					GoldpingerConfig.CheckTimeout,
 				)
 				defer cancel()
 
@@ -242,15 +271,15 @@ func CheckAllPods(checkAllCtx context.Context, pods map[string]*GoldpingerPod) *
 			PodIP:   response.podIPv4,
 		})
 		if response.checkAllPodResult.Response != nil &&
-			response.checkAllPodResult.Response.DNSResults != nil {
-			if result.DNSResults == nil {
-				result.DNSResults = make(map[string]models.DNSResults)
+			response.checkAllPodResult.Response.ProbeResults != nil {
+			if result.ProbeResults == nil {
+				result.ProbeResults = make(map[string]models.ProbeResults)
 			}
-			for host := range response.checkAllPodResult.Response.DNSResults {
-				if result.DNSResults[host] == nil {
-					result.DNSResults[host] = make(map[string]models.DNSResult)
+			for host := range response.checkAllPodResult.Response.ProbeResults {
+				if result.ProbeResults[host] == nil {
+					result.ProbeResults[host] = make(map[string][]models.ProbeResult)
 				}
-				result.DNSResults[host][response.podName] = response.checkAllPodResult.Response.DNSResults[host]
+				result.ProbeResults[host][response.podName] = response.checkAllPodResult.Response.ProbeResults[host]
 			}
 		}
 	}
@@ -273,7 +302,7 @@ func getClient(hostIP string) (*apiclient.Goldpinger, error) {
 	if hostIP == "" {
 		return nil, errors.New("Host or pod IP empty, can't make a call")
 	}
-	host := fmt.Sprintf("%s:%d", hostIP, GoldpingerConfig.Port)
+	host := net.JoinHostPort(hostIP, strconv.Itoa(GoldpingerConfig.Port))
 	transport := httptransport.New(host, "", nil)
 	client := apiclient.New(transport, strfmt.Default)
 	apiclient.Default.SetTransport(transport)
